@@ -407,6 +407,7 @@ struct RemoteConversationView: View {
                 ) {
                     HStack(spacing: 6) {
                         Button {
+                            composerFocused = false
                             showsSubagents = true
                         } label: {
                             HStack(spacing: 5) {
@@ -531,6 +532,9 @@ struct RemoteConversationView: View {
                 notification: .announcement,
                 argument: remoteLocalizedFormat("模型操作没有完成，%@", message)
             )
+        }
+        .onChange(of: selectedDetail) { _, detail in
+            if detail != nil { composerFocused = false }
         }
         .sheet(item: $selectedDetail) { item in
             ConversationDetailSheet(
@@ -961,6 +965,7 @@ struct RemoteConversationView: View {
 
     private var modelSelector: some View {
         Button {
+            composerFocused = false
             showsModelPicker = true
         } label: {
             HStack(alignment: dynamicTypeSize.isAccessibilitySize ? .top : .center, spacing: 4) {
@@ -1057,6 +1062,7 @@ struct RemoteConversationView: View {
                         selectedPhotoItems = []
                         composerNotice = nil
                         showsReferenceSuggestions = false
+                        composerFocused = false
                     } else {
                         shouldFollowNextSend = false
                     }
@@ -1682,6 +1688,7 @@ struct RemoteConversationView: View {
     }
 
     private func selectViewMode(_ mode: ViewMode) {
+        composerFocused = false
         guard mode != viewMode else { return }
         viewModeGeneration += 1
         if mode == .trajectory { pendingFollowAfterModeRestore = false }
@@ -1782,6 +1789,7 @@ private struct RemoteComposerTextView: UIViewRepresentable {
                     || (!coordinator.parent.isFocused && !coordinator.lastRequestedFocus)
                 guard shouldResign else { return }
                 view.resignFirstResponder()
+                coordinator.render(view, force: true)
             }
         }
     }
@@ -3131,7 +3139,10 @@ private struct RemoteSubagentConversationView: View {
                                             sessionID: viewModel.child.id
                                         )
                                     },
-                                    onOpenDetails: { selectedDetail = item }
+                                    onOpenDetails: {
+                                        composerFocused = false
+                                        selectedDetail = item
+                                    }
                                 )
                                 .id(item.id)
                             }
@@ -3403,6 +3414,7 @@ private struct RemoteSubagentConversationView: View {
                         shouldFollowNextSend = true
                         Task {
                             if await viewModel.send(outgoing) {
+                                composerFocused = false
                                 draft = ""
                             } else {
                                 shouldFollowNextSend = false

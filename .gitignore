@@ -27,3 +27,5 @@ keystore.properties
 /.worktrees/
 /.verify-tauri.log
 /.verify-tauri-home/
+# Xcode user-specific state
+xcuserdata/

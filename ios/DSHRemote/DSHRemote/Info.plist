@@ -18,15 +18,13 @@
 	<string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
 	<key>CFBundleShortVersionString</key>
 	<string>$(MARKETING_VERSION)</string>
-	<key>CFBundleVersion</key>
-	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
 			<key>CFBundleTypeRole</key>
 			<string>Viewer</string>
 			<key>CFBundleURLName</key>
-		<string>com.chokwinlee.dshremote.connect</string>
+			<string>com.chokwinlee.dshremote.connect</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>harnessremote</string>
@@ -34,19 +32,21 @@
 			</array>
 		</dict>
 	</array>
-	<key>LSRequiresIPhoneOS</key>
-	<true/>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
-	<key>NSCameraUsageDescription</key>
-	<string>扫描 DSH Desktop 显示的 Remote 配对二维码。</string>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>连接到你自己局域网内运行 DSH Desktop 的电脑。</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>扫描 DSH Desktop 显示的 Remote 配对二维码。</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>连接到你自己局域网内运行 DSH Desktop 的电脑。</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

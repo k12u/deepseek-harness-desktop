@@ -115,6 +115,9 @@ static PROFILE_WATCHER_STARTED: AtomicBool = AtomicBool::new(false);
 static REMOTE_STATUS_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static ALLOWED_HARNESS_ORIGIN: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 static CURRENT_HARNESS_URL: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+static CURRENT_HARNESS_TOKEN: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+static SERVE_PROXY_CHILD: Mutex<Option<Child>> = Mutex::new(None);
+static SERVE_PROXY_GENERATION: AtomicU64 = AtomicU64::new(0);
 static LOADED_PLUGIN_STATE: LazyLock<Mutex<Option<serde_json::Value>>> =
     LazyLock::new(|| Mutex::new(None));
 static DESKTOP_ACTION_TOKEN: LazyLock<String> = LazyLock::new(|| {
@@ -260,6 +263,48 @@ impl Drop for OperationGuard {
 struct HarnessPaths {
     home: PathBuf,
     dsh_home: PathBuf,
+}
+
+/// Harness loopback URL plus the startup token newer releases print in the
+/// readiness line (`dsh web: http://127.0.0.1:<port>/?token=<secret>`).
+#[derive(Clone, Debug)]
+struct HarnessAuth {
+    url: tauri::Url,
+    token: Option<String>,
+}
+
+impl HarnessAuth {
+    /// Root URL carrying the startup token, mirroring the Jupyter launch URL.
+    fn authenticated_url(&self) -> tauri::Url {
+        let mut url = self.url.clone();
+        if let Some(token) = self.token.as_ref() {
+            url.query_pairs_mut().append_pair("token", token);
+        }
+        url
+    }
+}
+
+fn valid_harness_token(value: &str) -> bool {
+    (16..=128).contains(&value.len())
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+/// Older Harness builds print a bare URL; newer builds append the one-time
+/// startup token as the sole query parameter.
+fn harness_token_from_query(url: &tauri::Url) -> Option<Option<String>> {
+    let Some(query) = url.query() else {
+        return Some(None);
+    };
+    if query.is_empty() {
+        return Some(None);
+    }
+    let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
+    if pairs.len() != 1 || pairs[0].0 != "token" || !valid_harness_token(&pairs[0].1) {
+        return None;
+    }
+    Some(Some(pairs.into_iter().next().expect("one pair").1))
 }
 
 fn redact_startup_line(line: &str) -> String {
@@ -973,7 +1018,7 @@ fn create_product_subagent_preset(dsh_home: &Path, product: ProductSubagent) -> 
     }
 
     let source = resolve_modules_directory()
-        .join("@deepseek-ai/dsh/config/agent-presets/standard/agent.cordis.yml");
+        .join("@deepseek-ai/dsh-agent-presets/presets/standard/agent.cordis.yml");
     let standard = fs::read_to_string(&source)
         .map_err(|error| format!("failed to read {}: {error}", source.display()))?;
     let enabled = enable_product_subagent_tool(&standard, product)?;
@@ -1828,23 +1873,25 @@ fn spawn_harness(mode: LaunchMode) -> Result<Child, String> {
         .map_err(|error| format!("failed to spawn {}: {error}", node.display()))
 }
 
-fn parse_readiness(line: &str) -> Option<tauri::Url> {
+fn parse_readiness(line: &str) -> Option<HarnessAuth> {
     let raw = line.trim().strip_prefix(READINESS_MARK)?.trim();
     let url: tauri::Url = raw.parse().ok()?;
-    let valid = url.scheme() == "http"
-        && url.host_str() == Some("127.0.0.1")
-        && url.port().is_some()
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.query().is_none()
-        && url.fragment().is_none();
-    valid.then_some(url)
+    let token = harness_token_from_query(&url)?;
+    let mut base = url.clone();
+    base.set_query(None);
+    let valid = base.scheme() == "http"
+        && base.host_str() == Some("127.0.0.1")
+        && base.port().is_some()
+        && base.username().is_empty()
+        && base.password().is_none()
+        && base.fragment().is_none();
+    valid.then_some(HarnessAuth { url: base, token })
 }
 
-fn wait_readiness(child: &mut Child) -> Result<(tauri::Url, StartupTail), String> {
+fn wait_readiness(child: &mut Child) -> Result<(HarnessAuth, StartupTail), String> {
     let stdout = child.stdout.take().ok_or("no stdout pipe")?;
     let stderr = child.stderr.take().ok_or("no stderr pipe")?;
-    let (sender, receiver) = mpsc::channel::<Result<tauri::Url, String>>();
+    let (sender, receiver) = mpsc::channel::<Result<HarnessAuth, String>>();
     let tail: StartupTail = Arc::new(Mutex::new(VecDeque::new()));
 
     let stderr_tail = Arc::clone(&tail);
@@ -1873,8 +1920,8 @@ fn wait_readiness(child: &mut Child) -> Result<(tauri::Url, StartupTail), String
             let safe = record_startup_line(&stdout_tail, "stdout", &line);
             println!("[dsh:out] {safe}");
             if !sent {
-                if let Some(url) = parse_readiness(&line) {
-                    let _ = sender.send(Ok(url));
+                if let Some(auth) = parse_readiness(&line) {
+                    let _ = sender.send(Ok(auth));
                     sent = true;
                 }
             }
@@ -1907,10 +1954,10 @@ fn wait_readiness(child: &mut Child) -> Result<(tauri::Url, StartupTail), String
     Ok((url, tail))
 }
 
-fn acknowledge_onboarding(origin: &tauri::Url) -> Result<(), String> {
+fn acknowledge_onboarding(auth: &HarnessAuth) -> Result<(), String> {
     let output = Command::new(resolve_node())
         .arg(resolve_onboarding_helper())
-        .arg(origin.as_str())
+        .arg(auth.authenticated_url().as_str())
         .arg(resolve_modules_directory())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2218,12 +2265,57 @@ fn refresh_remote_status_async(handle: tauri::AppHandle, force: bool) {
 }
 
 fn stop_remote_serve_process() {
+    stop_serve_proxy_process();
     REMOTE_SERVE_GENERATION.fetch_add(1, Ordering::SeqCst);
     if let Ok(mut guard) = REMOTE_SERVE_CHILD.lock() {
         if let Some(mut child) = guard.take() {
             remote::terminate_serve(&mut child);
         }
     }
+}
+
+fn stop_serve_proxy_process() {
+    SERVE_PROXY_GENERATION.fetch_add(1, Ordering::SeqCst);
+    if let Ok(mut guard) = SERVE_PROXY_CHILD.lock() {
+        if let Some(mut child) = guard.take() {
+            remote::terminate_serve(&mut child);
+        }
+    }
+}
+
+/// Surface a crashed loopback Serve proxy on the tailscale transport status.
+fn start_serve_proxy_monitor(handle: tauri::AppHandle, generation: u64) {
+    thread::spawn(move || loop {
+        thread::sleep(MONITOR_INTERVAL);
+        if SERVE_PROXY_GENERATION.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let status = match SERVE_PROXY_CHILD.lock() {
+            Ok(mut guard) => match guard.as_mut() {
+                Some(child) => child.try_wait(),
+                None => return,
+            },
+            Err(_) => Err(std::io::Error::other(
+                "Serve proxy supervisor lock poisoned",
+            )),
+        };
+        match status {
+            Ok(Some(exit)) => {
+                if let Ok(mut guard) = SERVE_PROXY_CHILD.lock() {
+                    *guard = None;
+                }
+                if REMOTE_DESIRED.load(Ordering::SeqCst) {
+                    if let Ok(mut state) = REMOTE_STATE.lock() {
+                        state.error = format!("跨网络连接的本地代理已退出（{exit}），入口已中断。");
+                    }
+                    emit_remote_status(&handle);
+                }
+                return;
+            }
+            Ok(None) => {}
+            Err(_) => return,
+        }
+    });
 }
 
 fn stop_lan_remote_process() {
@@ -2235,7 +2327,7 @@ fn stop_lan_remote_process() {
     }
 }
 
-fn parse_lan_remote_readiness(line: &str) -> Result<String, String> {
+fn parse_lan_remote_readiness(line: &str, expected_port: u16) -> Result<String, String> {
     let raw = line
         .trim()
         .strip_prefix("dsh lan remote:")
@@ -2245,18 +2337,22 @@ fn parse_lan_remote_readiness(line: &str) -> Result<String, String> {
         .parse()
         .map_err(|error| format!("局域网 Remote 返回了无效地址：{error}"))?;
     let host = url.host_str().ok_or("局域网 Remote 地址缺少主机。")?;
-    let octets: Vec<u8> = host
-        .split('.')
-        .map(str::parse::<u8>)
-        .collect::<Result<_, _>>()
-        .map_err(|_| "局域网 Remote 只接受私有 IPv4 地址。".to_string())?;
-    let private = octets.len() == 4
-        && (octets[0] == 10
-            || (octets[0] == 172 && (16..=31).contains(&octets[1]))
-            || (octets[0] == 192 && octets[1] == 168));
+    let loopback = host == "127.0.0.1";
+    let private = !loopback
+        && host
+            .split('.')
+            .map(str::parse::<u8>)
+            .collect::<Result<Vec<u8>, _>>()
+            .map(|octets| {
+                octets.len() == 4
+                    && (octets[0] == 10
+                        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                        || (octets[0] == 192 && octets[1] == 168))
+            })
+            .unwrap_or(false);
     if url.scheme() != "http"
-        || !private
-        || url.port() != Some(remote::LAN_REMOTE_PORT)
+        || (!loopback && !private)
+        || url.port() != Some(expected_port)
         || url.path() != "/"
         || url.query().is_some()
         || url.fragment().is_some()
@@ -2266,17 +2362,31 @@ fn parse_lan_remote_readiness(line: &str) -> Result<String, String> {
     Ok(url.to_string())
 }
 
+/// Which interface the Remote proxy binds and advertises.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteProxyBind {
+    /// The LAN credential (required bearer) is only reachable on the private
+    /// network interface; used for the same-Wi-Fi pairing entry.
+    Lan,
+    /// Loopback-only instance fronting Harness for the Tailscale Serve entry;
+    /// the tailnet itself is the security boundary there.
+    Loopback,
+}
+
 fn spawn_lan_remote_proxy(
-    harness_url: &tauri::Url,
+    auth: &HarnessAuth,
     token: &str,
+    bind: RemoteProxyBind,
+    port: u16,
 ) -> Result<(Child, String), String> {
-    if harness_url.scheme() != "http" || harness_url.host_str() != Some("127.0.0.1") {
+    if auth.url.scheme() != "http" || auth.url.host_str() != Some("127.0.0.1") {
         return Err("局域网 Remote 拒绝代理非 loopback Harness 地址。".into());
     }
-    let port = harness_url
+    let harness_port = auth
+        .url
         .port()
         .ok_or("Harness 没有返回可代理的 loopback 端口。")?;
-    let target = format!("http://127.0.0.1:{port}");
+    let target = format!("http://127.0.0.1:{harness_port}");
     let script = resolve_lan_remote_proxy();
     if !script.is_file() {
         return Err(format!(
@@ -2289,7 +2399,17 @@ fn spawn_lan_remote_proxy(
     command
         .arg(script)
         .args(["--target", &target, "--token", token, "--port"])
-        .arg(remote::LAN_REMOTE_PORT.to_string())
+        .arg(port.to_string())
+        .args(["--harness-version", &bundled_harness_version()])
+        .arg("--bind")
+        .arg(match bind {
+            RemoteProxyBind::Lan => "lan",
+            RemoteProxyBind::Loopback => "loopback",
+        });
+    if let Some(harness_token) = auth.token.as_ref() {
+        command.args(["--harness-token", harness_token]);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2319,7 +2439,7 @@ fn spawn_lan_remote_proxy(
             return Err("等待局域网 Remote 启动超时。".into());
         }
     };
-    match parse_lan_remote_readiness(&readiness) {
+    match parse_lan_remote_readiness(&readiness, port) {
         Ok(endpoint) => Ok((child, endpoint)),
         Err(error) => {
             remote::terminate_serve(&mut child);
@@ -2372,14 +2492,31 @@ fn start_lan_remote_monitor(handle: tauri::AppHandle, generation: u64) {
     });
 }
 
-fn sync_lan_remote(handle: &tauri::AppHandle, harness_url: &tauri::Url) -> Result<(), String> {
+/// Harness endpoint for Remote proxies, rebuilt from the registered readiness.
+fn current_harness_auth() -> Result<HarnessAuth, String> {
+    let url = CURRENT_HARNESS_URL
+        .lock()
+        .map_err(|_| "Harness 地址锁已损坏。".to_string())?
+        .clone()
+        .ok_or("Harness 尚未启动完成。")?
+        .parse::<tauri::Url>()
+        .map_err(|error| format!("Harness 地址无效：{error}"))?;
+    let token = CURRENT_HARNESS_TOKEN
+        .lock()
+        .map_err(|_| "Harness 凭据锁已损坏。".to_string())?
+        .clone();
+    Ok(HarnessAuth { url, token })
+}
+
+fn sync_lan_remote(handle: &tauri::AppHandle, auth: &HarnessAuth) -> Result<(), String> {
     let token = LAN_REMOTE_TOKEN
         .lock()
         .map_err(|_| "局域网 Remote 凭据锁已损坏。".to_string())?
         .clone()
         .ok_or("局域网 Remote 缺少配对凭据。")?;
     stop_lan_remote_process();
-    let (child, endpoint) = spawn_lan_remote_proxy(harness_url, &token)?;
+    let (child, endpoint) =
+        spawn_lan_remote_proxy(auth, &token, RemoteProxyBind::Lan, remote::LAN_REMOTE_PORT)?;
     let pairing_url = remote::authenticated_pairing_url(&endpoint, &token)?;
     let qr_svg = remote::pairing_qr_data_uri(&pairing_url)?;
     *LAN_REMOTE_CHILD
@@ -2475,18 +2612,22 @@ fn deactivate_remote_transport(
     emit_remote_status(handle);
 }
 
-fn sync_remote_serve(handle: &tauri::AppHandle, harness_url: &tauri::Url) -> Result<(), String> {
+fn sync_remote_serve(handle: &tauri::AppHandle, auth: &HarnessAuth) -> Result<(), String> {
     let info = inspect_tailscale_and_cache()?;
     if !info.https_ready {
         return Err("当前 Tailnet 尚未启用 HTTPS。请在 Tailscale 授权页完成 Enable HTTPS。".into());
     }
-    if harness_url.scheme() != "http" || harness_url.host_str() != Some("127.0.0.1") {
+    if auth.url.scheme() != "http" || auth.url.host_str() != Some("127.0.0.1") {
         return Err("Remote 拒绝代理非 loopback Harness 地址。".into());
     }
-    let port = harness_url
-        .port()
-        .ok_or("Harness 没有返回可代理的 loopback 端口。")?;
-    let target = format!("http://127.0.0.1:{port}");
+    if auth.url.port().is_none() {
+        return Err("Harness 没有返回可代理的 loopback 端口。".into());
+    }
+    let token = LAN_REMOTE_TOKEN
+        .lock()
+        .map_err(|_| "局域网 Remote 凭据锁已损坏。".to_string())?
+        .clone()
+        .ok_or("局域网 Remote 缺少配对凭据。")?;
 
     stop_remote_serve_process();
     remote::wait_until_port_clear(&info)?;
@@ -2498,9 +2639,25 @@ fn sync_remote_serve(handle: &tauri::AppHandle, harness_url: &tauri::Url) -> Res
         ));
     }
 
+    // Newer Harness releases require the browser-session cookie minted from
+    // the startup token, so Serve fronts a loopback Remote proxy that owns
+    // that exchange instead of talking to Harness directly.
+    let (proxy_child, _) = spawn_lan_remote_proxy(
+        auth,
+        &token,
+        RemoteProxyBind::Loopback,
+        remote::SERVE_PROXY_PORT,
+    )?;
+    let proxy_generation = SERVE_PROXY_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    *SERVE_PROXY_CHILD
+        .lock()
+        .map_err(|_| "Serve proxy supervisor lock poisoned".to_string())? = Some(proxy_child);
+    let target = format!("http://127.0.0.1:{}", remote::SERVE_PROXY_PORT);
+
     let mut child = remote::spawn_serve(&info, &target)?;
     if let Err(error) = remote::wait_until_serving(&mut child, &info, &target) {
         remote::terminate_serve(&mut child);
+        stop_serve_proxy_process();
         return Err(error);
     }
     if let Some(operation_id) = active_tailscale_operation_id("enable") {
@@ -2524,15 +2681,16 @@ fn sync_remote_serve(handle: &tauri::AppHandle, harness_url: &tauri::Url) -> Res
         state.error.clear();
         state.clear_error_when_tailscale_ready = false;
     }
+    start_serve_proxy_monitor(handle.clone(), proxy_generation);
     start_remote_serve_monitor(handle.clone(), generation);
     emit_remote_status(handle);
     Ok(())
 }
 
 fn relaunch_normal_harness(handle: &tauri::AppHandle) -> Result<(), String> {
-    let (child, url, tail) = start_harness(LaunchMode::Normal)?;
-    register_harness(handle, child, &url, LaunchMode::Normal, tail)?;
-    show_harness_window(handle, url, LaunchMode::Normal, None)
+    let (child, auth, tail) = start_harness(LaunchMode::Normal)?;
+    register_harness(handle, child, &auth, LaunchMode::Normal, tail)?;
+    show_harness_window(handle, &auth, LaunchMode::Normal, None)
 }
 
 fn rollback_remote_enable(
@@ -2744,13 +2902,7 @@ fn perform_lan_remote_enable(handle: tauri::AppHandle) -> Result<(), String> {
     {
         return Err("安全模式下不能开启局域网 Remote。".into());
     }
-    let harness_url: tauri::Url = CURRENT_HARNESS_URL
-        .lock()
-        .map_err(|_| "Harness 地址锁已损坏。".to_string())?
-        .clone()
-        .ok_or("Harness 尚未启动完成。")?
-        .parse()
-        .map_err(|error| format!("Harness 地址无效：{error}"))?;
+    let auth = current_harness_auth()?;
     let token = load_or_create_lan_remote_credential(&lan_remote_credential_path(&paths.dsh_home))?;
     if let Ok(mut saved) = LAN_REMOTE_TOKEN.lock() {
         *saved = Some(token);
@@ -2761,7 +2913,7 @@ fn perform_lan_remote_enable(handle: tauri::AppHandle) -> Result<(), String> {
         state.lan_enabled = false;
         state.lan_error.clear();
     }
-    if let Err(error) = sync_lan_remote(&handle, &harness_url) {
+    if let Err(error) = sync_lan_remote(&handle, &auth) {
         LAN_REMOTE_DESIRED.store(false, Ordering::SeqCst);
         if let Ok(mut saved) = LAN_REMOTE_TOKEN.lock() {
             *saved = None;
@@ -2801,16 +2953,8 @@ fn perform_lan_remote_reset(handle: tauri::AppHandle) -> Result<(), String> {
             .lock()
             .map(|state| state.lan_enabled)
             .unwrap_or(false);
-    let harness_url = if was_enabled {
-        Some(
-            CURRENT_HARNESS_URL
-                .lock()
-                .map_err(|_| "Harness 地址锁已损坏。".to_string())?
-                .clone()
-                .ok_or("Harness 尚未启动完成。")?
-                .parse::<tauri::Url>()
-                .map_err(|error| format!("Harness 地址无效：{error}"))?,
-        )
+    let auth = if was_enabled {
+        Some(current_harness_auth()?)
     } else {
         None
     };
@@ -2819,8 +2963,8 @@ fn perform_lan_remote_reset(handle: tauri::AppHandle) -> Result<(), String> {
     if let Ok(mut saved) = LAN_REMOTE_TOKEN.lock() {
         *saved = Some(token);
     }
-    if let Some(harness_url) = harness_url {
-        if let Err(error) = sync_lan_remote(&handle, &harness_url) {
+    if let Some(auth) = auth.as_ref() {
+        if let Err(error) = sync_lan_remote(&handle, auth) {
             LAN_REMOTE_DESIRED.store(false, Ordering::SeqCst);
             if let Ok(mut state) = REMOTE_STATE.lock() {
                 state.lan_enabled = false;
@@ -3458,17 +3602,39 @@ fn show_recovery_window(handle: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// The Harness mints its browser-session cookie while redirecting the token
+/// URL to a clean `/`. Wait for that redirect to commit so a follow-up
+/// navigation carrying desktop-only query parameters (which cannot include the
+/// token) is authorized by the session cookie.
+fn wait_for_harness_webview_cookie(window: &tauri::WebviewWindow, auth: &HarnessAuth) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if let Ok(current) = window.url() {
+            if current.query().is_none()
+                && current.host_str() == auth.url.host_str()
+                && current.port() == auth.url.port()
+            {
+                return true;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 fn show_harness_window(
     handle: &tauri::AppHandle,
-    mut url: tauri::Url,
+    auth: &HarnessAuth,
     mode: LaunchMode,
     notice: Option<HarnessNotice>,
 ) -> Result<(), String> {
     if let Ok(mut current) = CURRENT_HARNESS_URL.lock() {
-        *current = Some(url.as_str().to_string());
+        *current = Some(auth.url.as_str().to_string());
     }
+    let mut nav_url = auth.url.clone();
     if mode == LaunchMode::Safe {
-        url.query_pairs_mut()
+        nav_url
+            .query_pairs_mut()
             .append_pair("dsh-desktop-safe-mode", "1");
     }
     if let Some(notice) = notice {
@@ -3476,24 +3642,44 @@ fn show_harness_window(
             HarnessNotice::InstallVerifying(value) => ("dsh-desktop-plugin-verifying", value),
             HarnessNotice::InstallRolledBack(value) => ("dsh-desktop-plugin-rollback", value),
         };
-        url.query_pairs_mut().append_pair(key, &value);
+        nav_url.query_pairs_mut().append_pair(key, &value);
     }
     let remote_operation = REMOTE_STATE
         .lock()
         .ok()
         .and_then(|state| state.operation.clone());
     let internal_remote_restart =
-        append_remote_operation_resume_parameter(&mut url, remote_operation.as_ref());
+        append_remote_operation_resume_parameter(&mut nav_url, remote_operation.as_ref());
     let remote_operation_id = internal_remote_restart
         .then(|| remote_operation.as_ref().map(|operation| operation.id))
         .flatten();
+    let has_extras = nav_url.query().is_some();
     if let Ok(mut origin) = ALLOWED_HARNESS_ORIGIN.lock() {
-        *origin = Some(url.origin().ascii_serialization());
+        *origin = Some(auth.url.origin().ascii_serialization());
     }
     if let Some(window) = handle.get_webview_window("main") {
-        window
-            .navigate(url)
-            .map_err(|error| format!("failed to open Harness: {error}"))?;
+        match (auth.token.as_ref(), has_extras) {
+            (Some(_), true) => {
+                window
+                    .navigate(auth.authenticated_url())
+                    .map_err(|error| format!("failed to open Harness: {error}"))?;
+                wait_for_harness_webview_cookie(&window, auth);
+                window
+                    .navigate(nav_url)
+                    .map_err(|error| format!("failed to open Harness: {error}"))?;
+            }
+            (Some(token), false) => {
+                nav_url.query_pairs_mut().append_pair("token", token);
+                window
+                    .navigate(nav_url)
+                    .map_err(|error| format!("failed to open Harness: {error}"))?;
+            }
+            (None, _) => {
+                window
+                    .navigate(nav_url)
+                    .map_err(|error| format!("failed to open Harness: {error}"))?;
+            }
+        }
         let _ = window.set_title(PRODUCT_NAME);
         if !internal_remote_restart {
             let _ = window.set_min_size(Some(tauri::LogicalSize::new(960.0, 640.0)));
@@ -3502,7 +3688,11 @@ fn show_harness_window(
             let _ = window.set_focus();
         }
     } else {
-        build_main_window(handle, WebviewUrl::External(url), false)?;
+        build_main_window(
+            handle,
+            WebviewUrl::External(auth.authenticated_url()),
+            false,
+        )?;
     }
     if let Some(operation_id) = remote_operation_id {
         if let Ok(mut state) = REMOTE_STATE.lock() {
@@ -3514,22 +3704,22 @@ fn show_harness_window(
     Ok(())
 }
 
-fn start_harness(mode: LaunchMode) -> Result<(Child, tauri::Url, StartupTail), String> {
+fn start_harness(mode: LaunchMode) -> Result<(Child, HarnessAuth, StartupTail), String> {
     let mut child = spawn_harness(mode)?;
     println!("[dsh] harness spawned (pid {})", child.id());
-    let (url, tail) = match wait_readiness(&mut child) {
+    let (auth, tail) = match wait_readiness(&mut child) {
         Ok(value) => value,
         Err(error) => {
             terminate_child(&mut child);
             return Err(error);
         }
     };
-    println!("[dsh] harness ready at {url}");
-    match acknowledge_onboarding(&url) {
+    println!("[dsh] harness ready at {}", auth.url);
+    match acknowledge_onboarding(&auth) {
         Ok(()) => println!("[dsh] upstream welcome notice acknowledged"),
         Err(error) => eprintln!("[dsh] warning: {error}"),
     }
-    Ok((child, url, tail))
+    Ok((child, auth, tail))
 }
 
 fn pending_packages(value: &serde_json::Value) -> Vec<String> {
@@ -3575,9 +3765,9 @@ fn launch_normal_with_pending_fallback(handle: &tauri::AppHandle) -> Result<(), 
     }
 
     match start_harness(LaunchMode::Normal) {
-        Ok((child, url, tail)) => {
-            register_harness(handle, child, &url, LaunchMode::Normal, tail)?;
-            show_harness_window(handle, url, LaunchMode::Normal, notice)
+        Ok((child, auth, tail)) => {
+            register_harness(handle, child, &auth, LaunchMode::Normal, tail)?;
+            show_harness_window(handle, &auth, LaunchMode::Normal, notice)
         }
         Err(first_error) if should_fallback => {
             let label = rollback_pending_install(&paths.dsh_home).map_err(|rollback_error| {
@@ -3585,15 +3775,15 @@ fn launch_normal_with_pending_fallback(handle: &tauri::AppHandle) -> Result<(), 
                     "新插件启动失败，自动回滚也未完成。\n启动错误：{first_error}\n回滚错误：{rollback_error}"
                 )
             })?;
-            let (child, url, tail) = start_harness(LaunchMode::Normal).map_err(|rollback_error| {
+            let (child, auth, tail) = start_harness(LaunchMode::Normal).map_err(|rollback_error| {
                 format!(
                     "新插件启动失败；profile 已回滚，但 Harness 仍无法启动。\n首次错误：{first_error}\n回滚后错误：{rollback_error}"
                 )
             })?;
-            register_harness(handle, child, &url, LaunchMode::Normal, tail)?;
+            register_harness(handle, child, &auth, LaunchMode::Normal, tail)?;
             show_harness_window(
                 handle,
-                url,
+                &auth,
                 LaunchMode::Normal,
                 Some(HarnessNotice::InstallRolledBack(label)),
             )
@@ -3612,11 +3802,11 @@ fn rollback_runtime_plugin_failure(handle: &tauri::AppHandle, first_error: &str)
     };
     stop_managed_child();
     let result = rollback_pending_install(&paths.dsh_home).and_then(|label| {
-        let (child, url, tail) = start_harness(LaunchMode::Normal)?;
-        register_harness(handle, child, &url, LaunchMode::Normal, tail)?;
+        let (child, auth, tail) = start_harness(LaunchMode::Normal)?;
+        register_harness(handle, child, &auth, LaunchMode::Normal, tail)?;
         show_harness_window(
             handle,
-            url,
+            &auth,
             LaunchMode::Normal,
             Some(HarnessNotice::InstallRolledBack(label)),
         )
@@ -3754,7 +3944,7 @@ fn start_child_monitor(
 fn register_harness(
     handle: &tauri::AppHandle,
     child: Child,
-    url: &tauri::Url,
+    auth: &HarnessAuth,
     mode: LaunchMode,
     tail: StartupTail,
 ) -> Result<(), String> {
@@ -3762,6 +3952,9 @@ fn register_harness(
     *CHILD
         .lock()
         .map_err(|_| "harness supervisor lock poisoned".to_string())? = Some(child);
+    if let Ok(mut token) = CURRENT_HARNESS_TOKEN.lock() {
+        *token = auth.token.clone();
+    }
     set_recovery_state(
         if mode == LaunchMode::Safe {
             "safe-mode"
@@ -3783,12 +3976,12 @@ fn register_harness(
         if let Some(operation_id) = active_tailscale_operation_id("enable") {
             publish_remote_operation_stage(handle, operation_id, "starting-serve", true, "");
         }
-        if let Err(error) = sync_remote_serve(handle, url) {
+        if let Err(error) = sync_remote_serve(handle, auth) {
             deactivate_remote_transport(Some(error), false, handle);
         }
     }
     if mode == LaunchMode::Normal && LAN_REMOTE_DESIRED.load(Ordering::SeqCst) {
-        if let Err(error) = sync_lan_remote(handle, url) {
+        if let Err(error) = sync_lan_remote(handle, auth) {
             LAN_REMOTE_DESIRED.store(false, Ordering::SeqCst);
             if let Ok(mut state) = REMOTE_STATE.lock() {
                 state.lan_enabled = false;
@@ -3977,9 +4170,9 @@ fn perform_recovery_action(handle: tauri::AppHandle, action: RecoveryAction) -> 
         None
     };
     let result = if let Some(mode) = mode {
-        start_harness(mode).and_then(|(child, url, tail)| {
-            register_harness(&handle, child, &url, mode, tail)?;
-            if let Err(error) = show_harness_window(&handle, url, mode, None) {
+        start_harness(mode).and_then(|(child, auth, tail)| {
+            register_harness(&handle, child, &auth, mode, tail)?;
+            if let Err(error) = show_harness_window(&handle, &auth, mode, None) {
                 stop_managed_child();
                 return Err(error);
             }
@@ -4332,7 +4525,7 @@ mod tests {
         redact_startup_line, remote_transition_in_progress, resolve_modules_directory,
         restore_last_known_good, rotate_lan_remote_credential, safe_profile_manifest, same_file,
         smooth_stream_enabled_from, update_remote_operation_state, usage_record_from_event,
-        valid_lan_remote_token, validate_plugin_spec, without_cli_path_block,
+        valid_harness_token, valid_lan_remote_token, validate_plugin_spec, without_cli_path_block,
         write_profile_snapshot, write_smooth_stream_preference, RemoteOperationState,
         RemoteRuntimeState, CLAUDE_CODE_SUBAGENT, CLI_PATH_BLOCK, CODEX_SUBAGENT,
         LEGACY_CLI_PATH_BLOCK,
@@ -4444,36 +4637,47 @@ mod tests {
 
     #[test]
     fn accepts_only_explicit_loopback_readiness_urls() {
-        assert_eq!(
-            parse_readiness("dsh web: http://127.0.0.1:3210").map(|url| url.as_str().to_string()),
-            Some("http://127.0.0.1:3210/".into())
-        );
+        let bare = parse_readiness("dsh web: http://127.0.0.1:3210").unwrap();
+        assert_eq!(bare.url.as_str(), "http://127.0.0.1:3210/");
+        assert_eq!(bare.token, None);
+        let token = "aB3xYz_9QrS7tUvWx1yZ0aBcDdEfFgHhIiJjKk5LmX";
+        assert!(valid_harness_token(token));
+        let with_token =
+            parse_readiness(&format!("dsh web: http://127.0.0.1:3210/?token={token}")).unwrap();
+        assert_eq!(with_token.url.as_str(), "http://127.0.0.1:3210/");
+        assert_eq!(with_token.token.as_deref(), Some(token));
         for line in [
-            "prefix dsh web: http://127.0.0.1:3210",
-            "dsh web: https://127.0.0.1:3210",
-            "dsh web: http://127.0.0.1.evil.example:3210",
-            "dsh web: http://localhost:3210",
-            "dsh web: http://127.0.0.1",
-            "dsh web: http://127.0.0.1:3210/?token=secret",
+            "prefix dsh web: http://127.0.0.1:3210".to_string(),
+            "dsh web: https://127.0.0.1:3210".to_string(),
+            "dsh web: http://127.0.0.1.evil.example:3210".to_string(),
+            "dsh web: http://localhost:3210".to_string(),
+            "dsh web: http://127.0.0.1".to_string(),
+            "dsh web: http://127.0.0.1:3210/?token=short".to_string(),
+            format!("dsh web: http://127.0.0.1:3210/?token={token}&extra=1"),
+            "dsh web: http://127.0.0.1:3210/?foo=1".to_string(),
         ] {
-            assert!(parse_readiness(line).is_none(), "accepted {line}");
+            assert!(parse_readiness(&line).is_none(), "accepted {line}");
         }
     }
 
     #[test]
     fn accepts_only_private_lan_proxy_readiness_urls() {
         assert_eq!(
-            parse_lan_remote_readiness("dsh lan remote: http://192.168.1.20:8765/").unwrap(),
+            parse_lan_remote_readiness("dsh lan remote: http://192.168.1.20:8765/", 8765).unwrap(),
             "http://192.168.1.20:8765/"
         );
-        assert!(parse_lan_remote_readiness("dsh lan remote: http://10.0.0.4:8765/").is_ok());
+        assert!(parse_lan_remote_readiness("dsh lan remote: http://10.0.0.4:8765/", 8765).is_ok());
+        assert!(parse_lan_remote_readiness("dsh lan remote: http://127.0.0.1:8766/", 8766).is_ok());
         for line in [
             "dsh lan remote: http://8.8.8.8:8765/",
             "dsh lan remote: https://192.168.1.20:8765/",
             "dsh lan remote: http://192.168.1.20:8080/",
             "dsh lan remote: http://192.168.1.20:8765/?token=secret",
         ] {
-            assert!(parse_lan_remote_readiness(line).is_err(), "accepted {line}");
+            assert!(
+                parse_lan_remote_readiness(line, 8765).is_err(),
+                "accepted {line}"
+            );
         }
     }
 

@@ -11,6 +11,8 @@ use qrcode::{render::svg, QrCode};
 
 pub const REMOTE_PORT: u16 = 8443;
 pub const LAN_REMOTE_PORT: u16 = 8765;
+/// Loopback-only Remote proxy fronting Harness for the Tailscale Serve entry.
+pub const SERVE_PROXY_PORT: u16 = 8766;
 const SERVE_START_TIMEOUT: Duration = Duration::from_secs(12);
 const SERVE_STOP_TIMEOUT: Duration = Duration::from_secs(4);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);

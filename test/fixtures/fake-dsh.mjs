@@ -49,6 +49,8 @@ function serveFixture(body = 'Harness fixture ready') {
 if (mode === 'ready') {
   console.log('booting')
   console.log('dsh web: http://127.0.0.1:43123')
+} else if (mode === 'token-ready') {
+  console.log('dsh web: http://127.0.0.1:43123/?token=Ab12Cd34Ef56Gh78Ij90Kl12Mn34Op56Qr78St90Uv2')
 } else if (mode === 'exit') {
   console.error('fixture startup failed')
   setTimeout(() => { process.exit(7) }, 10)

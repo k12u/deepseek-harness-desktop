@@ -22,9 +22,31 @@ function supervisor(mode: string, startupTimeoutMs = 2_000): HarnessSupervisor {
 test('accepts only an official loopback readiness URL', () => {
   assert.equal(parseHarnessUrl('dsh web: http://127.0.0.1:3080'), 'http://127.0.0.1:3080')
   assert.equal(parseHarnessUrl('dsh web: http://127.0.0.1:3080 (LAN: http://10.0.0.2:3080)'), 'http://127.0.0.1:3080')
+  assert.equal(parseHarnessUrl('dsh web: http://127.0.0.1:3080/'), 'http://127.0.0.1:3080')
   assert.equal(parseHarnessUrl('dsh web: http://localhost:3080'), undefined)
   assert.equal(parseHarnessUrl('dsh web: http://127.0.0.1:0'), undefined)
   assert.equal(parseHarnessUrl('dsh web: http://127.0.0.1:70000'), undefined)
+})
+
+test('keeps the startup token from newer readiness URLs', () => {
+  const token = 'Ab12Cd34Ef56Gh78Ij90Kl12Mn34Op56Qr78St90Uv2'
+  assert.equal(
+    parseHarnessUrl(`dsh web: http://127.0.0.1:54760/?token=${token}`),
+    `http://127.0.0.1:54760/?token=${token}`,
+  )
+  assert.equal(
+    parseHarnessUrl(`dsh web: http://127.0.0.1:54760/?token=${token} extra`),
+    `http://127.0.0.1:54760/?token=${token}`,
+  )
+  assert.equal(parseHarnessUrl('dsh web: http://127.0.0.1:54760/?token=short'), undefined)
+  assert.equal(
+    parseHarnessUrl('dsh web: http://127.0.0.1:54760/?foo=1'),
+    undefined,
+  )
+  assert.equal(
+    parseHarnessUrl(`dsh web: http://127.0.0.1:54760/?token=${token}&extra=1`),
+    undefined,
+  )
 })
 
 test('resolves on readiness and stops the child', async () => {
@@ -33,6 +55,18 @@ test('resolves on readiness and stops the child', async () => {
     assert.equal(await runtime.start(), 'http://127.0.0.1:43123')
   })
   await assert.doesNotReject(runtime.stop())
+})
+
+test('resolves the token URL emitted by newer harness builds', async () => {
+  const runtime = supervisor('token-ready')
+  try {
+    assert.equal(
+      await runtime.start(),
+      'http://127.0.0.1:43123/?token=Ab12Cd34Ef56Gh78Ij90Kl12Mn34Op56Qr78St90Uv2',
+    )
+  } finally {
+    await assert.doesNotReject(runtime.stop())
+  }
 })
 
 test('reports an early process exit with recent output', async () => {

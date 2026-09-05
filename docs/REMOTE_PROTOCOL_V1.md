@@ -8,13 +8,17 @@ off the user's computer.
 
 - Contract name: `dsh-remote`
 - Contract version: `1`
-- Current Harness line: `@deepseek-ai/dsh@0.1.0-rc.8`
+- Current Harness line: `@deepseek-ai/dsh@0.1.2-rc.1`
 - Clients must ignore unknown JSON object fields.
 - A missing optional capability must degrade to a readable, retryable state.
 - A server response with a mismatched `rpcId` must be rejected.
 
 `host.describe` remains the authoritative connection check. A successful HTTP
 status from another route is not sufficient evidence that a host is Harness.
+
+Harness 0.1.2 renamed its own RPC surface (slash paths, `args` payloads, and a
+`remote.mux` stream carrier). Desktop keeps this v1 contract stable for phones
+by translating at the LAN proxy; clients never see the upstream rename.
 
 ## Transport
 

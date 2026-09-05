@@ -23,9 +23,9 @@
 
 ![DSH Desktop](docs/images/readme-hero-en.png)
 
-*macOS downloads under 90 MB, with the complete Harness rc.8 runtime included.*
+*macOS downloads under 90 MB, with the complete Harness 0.1.2-rc.1 runtime included.*
 
-DSH Desktop runs the official [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) Web UI and runtime in a desktop window. The repository also contains DSH Remote native companions for continuing the computer's projects, sessions, and running tasks from iPhone and Android. This build is aligned with `@deepseek-ai/dsh@0.1.0-rc.8` and shows that bundled Harness version in the sidebar. The desktop app manages the local Harness process automatically, so users do not need to install Node.js or start `dsh web` themselves.
+DSH Desktop runs the official [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) Web UI and runtime in a desktop window. The repository also contains DSH Remote native companions for continuing the computer's projects, sessions, and running tasks from iPhone and Android. This build is aligned with `@deepseek-ai/dsh@0.1.2-rc.1` and shows that bundled Harness version in the sidebar. The desktop app manages the local Harness process automatically, so users do not need to install Node.js or start `dsh web` themselves.
 
 > [!IMPORTANT]
 > This is an independent community project, not an official DeepSeek AI product. DeepSeek Harness is a developer preview and may introduce breaking changes.
@@ -35,7 +35,7 @@ DSH Desktop runs the official [DeepSeek Harness](https://github.com/deepseek-ai/
 - **Multimodal sessions** — paste or attach images and send them through the normal Harness conversation flow when the selected provider and model declare image input support. Image messages remain visible in session history.
 - **Usage at a glance on macOS** — see today and seven-day token totals, estimated cost, active task count, and aggregate running throughput without leaving the current session.
 - **Compact macOS package** — stays under 90 MB while bundling the complete Harness runtime, using Tauri and the system WKWebView instead of shipping Chromium.
-- **Visible runtime alignment** — the sidebar identifies both the Desktop release and its bundled Harness version, such as `DSH Desktop v0.4.1 · Harness rc.8`.
+- **Visible runtime alignment** — the sidebar identifies both the Desktop release and its bundled Harness version, such as `DSH Desktop v0.4.1 · Harness 0.1.2-rc.1`.
 - **Ready to run** — includes everything needed to start Harness, with no separate Node.js installation or terminal command. The app starts and stops the local runtime automatically.
 - **Native mobile Remote** — the SwiftUI iPhone client and Kotlin/Compose Android client pair on trusted Wi-Fi or the user's own Tailscale network, then browse projects, create sessions, steer tasks, handle approvals, send images, and follow subagents without moving execution off the computer.
 
@@ -45,7 +45,7 @@ Cost figures are estimates derived from local token logs and available public mo
 
 ![Multimodal session and usage insights](docs/images/readme-features-en.png)
 
-*A real Harness rc.8 image-input session with live token and cost insights, using `google/gemini-2.5-flash-lite` through OpenRouter.*
+*A real Harness 0.1.2-rc.1 image-input session with live token and cost insights, using `google/gemini-2.5-flash-lite` through OpenRouter.*
 
 The compact title-bar summary stays visible while you work. Open it for input, output, cache, cost, and live-throughput details. Usage is calculated locally from Harness session history, with estimated costs based on available public model prices.
 

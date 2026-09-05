@@ -1,7 +1,8 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import type { Readable } from 'node:stream'
 
-const READY_LINE = /^dsh web:\s+(http:\/\/127\.0\.0\.1:(\d+))(?:\s|$)/
+const READY_LINE =
+  /^dsh web:\s+(http:\/\/127\.0\.0\.1:(\d+))\/?(?:\?token=([A-Za-z0-9_-]{16,128}))?(?:\s|$)/
 const STARTUP_TAIL_LINES = 40
 const READINESS_GRACE_MS = 300
 const STOP_GRACE_MS = 5_000
@@ -21,13 +22,20 @@ export interface HarnessSupervisorOptions {
   onLog?: (source: HarnessLogSource, line: string) => void
 }
 
-/** Parse the official CLI readiness line and reject non-loopback or invalid ports. */
+/**
+ * Parse the official CLI readiness line and reject non-loopback or invalid
+ * ports. Older Harness builds print a bare URL; newer builds append the
+ * one-time startup token, which stays in the returned URL so the first
+ * navigation can exchange it for the browser-session cookie.
+ */
 export function parseHarnessUrl(line: string): string | undefined {
   const match = READY_LINE.exec(line)
   if (match === null) return undefined
   const port = Number(match[2])
   if (!Number.isInteger(port) || port < 1 || port > 65_535) return undefined
-  return match[1]
+  const base = match[1]
+  const token = match[3]
+  return token === undefined ? base : `${base}/?token=${token}`
 }
 
 function redactSecrets(line: string): string {
@@ -102,9 +110,11 @@ export class HarnessSupervisor {
         reject(error)
       }
       const handleLine = (source: HarnessLogSource, rawLine: string): void => {
+        // Logs and the startup tail must never carry the token, but the
+        // readiness parser needs the raw line to capture it.
         const line = redactSecrets(rawLine)
         this.record(source, line)
-        const url = source === 'stdout' ? parseHarnessUrl(line) : undefined
+        const url = source === 'stdout' ? parseHarnessUrl(rawLine) : undefined
         if (url !== undefined && readinessTimer === undefined) {
           readinessTimer = setTimeout(() => {
             finish(url)

@@ -68,7 +68,12 @@ interface RemoteTestApi {
 
 interface LanRemoteProxyTestApi {
   MAX_BODY_BYTES: number
-  createLanRemoteServer: (target: URL, token: string) => Server
+  createLanRemoteServer: (
+    target: URL,
+    token: string,
+    session?: { cookie?: string; requireToken?: boolean },
+  ) => Server
+  exchangeHarnessCookie: (target: URL, harnessToken: string) => Promise<string>
   forwardRequestBody: (request: PassThrough, upstream: Writable, maxBytes?: number) => Promise<number>
   inspectDeclaredBodyLength: (
     value: string | string[] | undefined,
@@ -78,6 +83,7 @@ interface LanRemoteProxyTestApi {
     request: { headers: Record<string, string | undefined> },
     target: URL,
     declaredBytes?: number,
+    cookie?: string,
   ) => Record<string, string>
   streamedBodyExceedsLimit: (bytes: number, maxBytes?: number) => boolean
 }
@@ -124,6 +130,12 @@ async function loadLanRemoteProxyApi(): Promise<LanRemoteProxyTestApi> {
   const url = pathToFileURL(join(process.cwd(), 'scripts', 'lan-remote-proxy.mjs'))
   url.searchParams.set('test', `${process.pid}-${Date.now()}`)
   return await import(url.href) as LanRemoteProxyTestApi
+}
+
+async function loadTranslateApi(): Promise<Record<string, any>> {
+  const url = pathToFileURL(join(process.cwd(), 'scripts', 'lan-remote-translate.mjs'))
+  url.searchParams.set('test', `${process.pid}-${Date.now()}`)
+  return await import(url.href) as Record<string, any>
 }
 
 async function listenOnLoopback(server: Server): Promise<number> {
@@ -847,6 +859,147 @@ test('LAN Remote strips credentials, rewrites Host, streams large requests, and 
   })
 })
 
+test('LAN Remote forwards the Harness session cookie it exchanged at startup', async (t) => {
+  const api = await loadLanRemoteProxyApi()
+  const token = 'b'.repeat(64)
+  const cookie = 'dsh-auth-aCrWA3UKIm2=v1.eyJ2ZXJzaW9uIjoxfQ.sig'
+  let upstreamCookie: string | undefined
+  let upstreamUpgradeCookie: string | undefined
+  const upstreamServer = http.createServer((request, response) => {
+    upstreamCookie = request.headers.cookie
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end('{"ok":true}')
+  })
+  upstreamServer.on('upgrade', (request, socket) => {
+    upstreamUpgradeCookie = request.headers.cookie
+    socket.end('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
+  })
+  t.after(() => closeServer(upstreamServer))
+  const upstreamPort = await listenOnLoopback(upstreamServer)
+  const proxyServer = api.createLanRemoteServer(
+    new URL(`http://127.0.0.1:${upstreamPort}`),
+    token,
+    { cookie, requireToken: true },
+  )
+  t.after(() => closeServer(proxyServer))
+  const proxyPort = await listenOnLoopback(proxyServer)
+
+  const accepted = await post(proxyPort, '/api/host.describe', token, Buffer.alloc(0))
+  assert.equal(accepted.status, 200)
+  assert.equal(upstreamCookie, cookie)
+
+  await new Promise<void>((resolve, reject) => {
+    const request = http.request({
+      hostname: '127.0.0.1',
+      port: proxyPort,
+      path: '/api/events.mux',
+      headers: {
+        authorization: `Bearer ${token}`,
+        connection: 'Upgrade',
+        upgrade: 'websocket',
+        'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==',
+        'sec-websocket-version': '13',
+      },
+    })
+    request.once('upgrade', (_response, socket) => {
+      socket.destroy()
+      resolve()
+    })
+    request.once('error', reject)
+    request.end()
+  })
+  assert.equal(upstreamUpgradeCookie, cookie)
+})
+
+test('Tailscale Serve path keeps unpaired HTTPS clients working', async (t) => {
+  const api = await loadLanRemoteProxyApi()
+  const token = 'c'.repeat(64)
+  let upstreamRequests = 0
+  const upstreamServer = http.createServer((_request, response) => {
+    upstreamRequests += 1
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end('{"ok":true}')
+  })
+  t.after(() => closeServer(upstreamServer))
+  const upstreamPort = await listenOnLoopback(upstreamServer)
+  const proxyServer = api.createLanRemoteServer(
+    new URL(`http://127.0.0.1:${upstreamPort}`),
+    token,
+    { cookie: '', requireToken: false },
+  )
+  t.after(() => closeServer(proxyServer))
+  const proxyPort = await listenOnLoopback(proxyServer)
+
+  const unpaired = await new Promise<{ body: string; status: number }>((resolve, reject) => {
+    const request = http.request({
+      hostname: '127.0.0.1',
+      port: proxyPort,
+      method: 'POST',
+      path: '/api/host.describe',
+      headers: { 'content-type': 'application/json', 'content-length': '2' },
+    }, response => {
+      const chunks: Buffer[] = []
+      response.on('data', chunk => chunks.push(Buffer.from(chunk)))
+      response.on('end', () => resolve({
+        body: Buffer.concat(chunks).toString('utf8'),
+        status: response.statusCode ?? 0,
+      }))
+    })
+    request.once('error', reject)
+    request.end('{}')
+  })
+  assert.equal(unpaired.status, 200)
+  assert.equal(upstreamRequests, 1)
+
+  const badCredential = await new Promise<{ status: number }>((resolve, reject) => {
+    const request = http.request({
+      hostname: '127.0.0.1',
+      port: proxyPort,
+      method: 'POST',
+      path: '/api/host.describe',
+      headers: {
+        authorization: 'Bearer wrong',
+        'content-type': 'application/json',
+        'content-length': '2',
+      },
+    }, response => {
+      response.resume()
+      resolve({ status: response.statusCode ?? 0 })
+    })
+    request.once('error', reject)
+    request.end('{}')
+  })
+  assert.equal(badCredential.status, 401)
+})
+
+test('exchanges the Harness startup token for its browser-session cookie', async (t) => {
+  const api = await loadLanRemoteProxyApi()
+  const token = 'k'.repeat(43)
+  const goodCookie = 'dsh-auth-aCrWA3UKIm2=v1.eyJ2ZXJzaW9uIjoxfQ.sig'
+  const exchangeServer = http.createServer((request, response) => {
+    const url = new URL(request.url ?? '/', 'http://dsh.invalid')
+    if (url.searchParams.get('token') === token) {
+      response.writeHead(303, {
+        location: '/',
+        'set-cookie': [
+          `${goodCookie}; Max-Age=2592000; Path=/; HttpOnly; SameSite=Strict`,
+          'dsh-other=ignored; Path=/',
+        ],
+      })
+      response.end()
+    } else {
+      response.writeHead(401)
+      response.end()
+    }
+  })
+  t.after(() => closeServer(exchangeServer))
+  const exchangePort = await listenOnLoopback(exchangeServer)
+  const target = new URL(`http://127.0.0.1:${exchangePort}`)
+
+  assert.equal(await api.exchangeHarnessCookie(target, token), goodCookie)
+  await assert.rejects(api.exchangeHarnessCookie(target, 'w'.repeat(43)), /rejected its startup token/)
+})
+
 test('iOS Remote ships complete English and Simplified Chinese product-copy coverage', async () => {
   const iosRoot = join(process.cwd(), 'ios', 'DSHRemote', 'DSHRemote')
   const englishPath = join(iosRoot, 'en.lproj', 'Localizable.strings')
@@ -966,6 +1119,197 @@ test('Remote v1 contract fixtures stay aligned with the reviewed mobile boundary
     'question/requested',
     'session/queue',
   ])
+})
+
+test('v1 RPC routes translate onto the Harness 0.1.2 typert surface', async (t) => {
+  const translate = await loadTranslateApi()
+  const promptRoute = translate.routeV1Method('session.prompt')
+  assert.equal(promptRoute.upstream.path, 'session/prompt')
+  assert.equal(typeof promptRoute.upstream.wrap, 'function')
+  assert.deepEqual(translate.routeV1Method('host.describe'), { synthetic: 'host.describe' })
+  assert.equal(translate.routeV1Method('settings.describe'), undefined)
+
+  const minted: string[] = []
+  const prompt = translate.translateRequest('session.prompt', {
+    sessionId: 's1',
+    mode: 'queue',
+    content: [{ type: 'text', text: 'hi' }],
+  }, translate.routeV1Method('session.prompt').upstream)
+  assert.equal(prompt.method, 'session/prompt')
+  assert.equal(prompt.payload.args.request.sessionId, 's1')
+  assert.match(prompt.payload.args.request.requestId, /./)
+  minted.push(prompt.payload.args.request.requestId)
+
+  const list = translate.translateRequest('session.list', {}, translate.routeV1Method('session.list').upstream)
+  assert.deepEqual(list, { method: 'session/list', payload: { args: { _request: {} } } })
+
+  const interrupt = translate.translateRequest('subagent.interrupt', {
+    parentSessionId: 'p',
+    childSessionId: 'c',
+  }, translate.routeV1Method('subagent.interrupt').upstream)
+  assert.deepEqual(interrupt.payload.args, {
+    childSessionId: 'c',
+    parentSessionId: 'p',
+    mode: 'continuable',
+  })
+
+  const reference = translate.translateRequest('fileReferences/list', { args: { agentId: 'a', query: 'q' } }, translate.routeV1Method('fileReferences/list').upstream)
+  assert.deepEqual(reference, { method: 'fileReferences/list', payload: { args: { agentId: 'a', query: 'q' } } })
+})
+
+test('packed chunk history rows expand back into phone-readable chunk events', async (t) => {
+  const translate = await loadTranslateApi()
+  const history = translate.recordsToV1History([
+    { type: 'event', event: { type: 'user/message', seq: 1, time: 100, data: { content: [{ type: 'text', text: 'hi' }] } } },
+    {
+      type: 'chunks',
+      event: {
+        type: 'text-chunks',
+        seq0: 2,
+        time0: 200,
+        data: { turn: 1, step: 1, index: 0, dt: [10, 30], texts: ['he', 'llo', '!'] },
+      },
+    },
+    { type: 'event', event: { type: 'assistant/message', seq: 5, time: 300, data: { message: { content: [{ type: 'text', text: 'hello!' }] } } } },
+  ], false, { values: { title: 't' } }, 50)
+  assert.equal(history.events.length, 5)
+  assert.deepEqual(history.events.map((entry: { event: { type: string } }) => entry.event.type), [
+    'user/message',
+    'assistant/chunk',
+    'assistant/chunk',
+    'assistant/chunk',
+    'assistant/message',
+  ])
+  const [firstChunk, secondChunk, thirdChunk] = history.events.slice(1).map((entry: { event: { type: string } }) => entry.event)
+  assert.deepEqual(firstChunk.data, { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'he' } })
+  assert.equal(firstChunk.seq, 2)
+  assert.equal(firstChunk.time, 200)
+  assert.equal(secondChunk.time, 210)
+  assert.equal(thirdChunk.time, 240)
+  assert.equal(history.hasMore, false)
+  assert.deepEqual(history.projections, { values: { title: 't' } })
+
+  const truncated = translate.recordsToV1History(
+    [{ type: 'event', event: { type: 'user/message', seq: 1, time: 1, data: {} } }],
+    true,
+    undefined,
+    0,
+  )
+  assert.equal(truncated.hasMore, true)
+})
+
+test('control frames and upstream waterfalls map onto v1 live events', async (t) => {
+  const translate = await loadTranslateApi()
+  assert.deepEqual(translate.controlFrameToV1({
+    type: 'projection',
+    sessionId: 's1',
+    key: 'title',
+    value: 'hello',
+    seq: 4,
+  }), [{ type: 'session/projection', sessionId: 's1' }])
+  assert.deepEqual(translate.controlFrameToV1({
+    type: 'queue',
+    sessionId: 's1',
+    items: [{ id: 'm1', placement: 'queued', message: { id: 'm1', content: [] } }],
+  }), [{
+    type: 'session/queue',
+    sessionId: 's1',
+    items: [{ id: 'm1', placement: 'queued', message: { id: 'm1', content: [] } }],
+  }])
+  assert.deepEqual(translate.controlFrameToV1({ type: 'jobs', sessionId: 's1', jobs: [] }), [])
+
+  const approval = translate.upstreamEventToV1({
+    type: 'waterfall',
+    event: 'approval/request',
+    eventId: 'evt-1',
+    agentId: 's1',
+    request: { toolName: 'exec_command', reason: 'build' },
+  })
+  assert.deepEqual(approval.frames, [{
+    type: 'approval/requested',
+    sessionId: 's1',
+    approvalId: 'evt-1',
+    toolName: 'exec_command',
+    reason: 'build',
+  }])
+  assert.deepEqual(approval.pending, { eventId: 'evt-1', kind: 'approval', sessionId: 's1' })
+
+  const question = translate.upstreamEventToV1({
+    type: 'waterfall',
+    event: 'user-questions/request',
+    eventId: 'evt-2',
+    agentId: 's1',
+    request: { questions: [{ id: 'q1', question: 'Proceed?' }] },
+  })
+  assert.deepEqual(question.frames, [{
+    type: 'question/requested',
+    sessionId: 's1',
+    questions: [{ id: 'q1', question: 'Proceed?' }],
+  }])
+  assert.deepEqual(question.pending, { eventId: 'evt-2', kind: 'question', sessionId: 's1' })
+
+  assert.deepEqual(translate.upstreamEventToV1({ type: 'emit', event: 'api-session/status', args: [] }).frames, [])
+})
+
+test('phone respond bodies map onto upstream waterfall outcomes', async (t) => {
+  const translate = await loadTranslateApi()
+  assert.deepEqual(translate.respondToUpstreamEventResult({
+    type: 'client-response',
+    rpcId: 'evt-1',
+    result: { ok: true, value: { sessionId: 's1', approvalId: 'evt-1', outcome: 'allowed-once' } },
+  }), { kind: 'approval', outcome: { kind: 'result', value: 'allowed-once' } })
+  assert.deepEqual(translate.respondToUpstreamEventResult({
+    type: 'client-response',
+    rpcId: 'evt-2',
+    result: { ok: true, value: { sessionId: 's1', answer: { answers: [{ id: 'q1', selected: ['Yes'] }] } } },
+  }), {
+    kind: 'question',
+    outcome: { kind: 'result', value: { answers: [{ id: 'q1', selected: ['Yes'] }] } },
+  })
+  assert.deepEqual(translate.respondToUpstreamEventResult({
+    type: 'client-response',
+    rpcId: 'evt-2',
+    result: { ok: false, error: { code: 'cancelled', message: 'closed', details: {} } },
+  }), {
+    kind: undefined,
+    outcome: { kind: 'rejected', error: { code: 'cancelled', message: 'closed', details: {} } },
+  })
+  assert.equal(translate.respondToUpstreamEventResult({ result: { ok: true, value: {} } }), undefined)
+
+  assert.deepEqual(translate.resolvedFrame('approval', 's1', 'evt-1'), {
+    type: 'approval/resolved',
+    sessionId: 's1',
+    approvalId: 'evt-1',
+  })
+  assert.deepEqual(translate.resolvedFrame('question', 's1', 'evt-2'), {
+    type: 'question/resolved',
+    sessionId: 's1',
+    questionRpcId: 'evt-2',
+  })
+})
+
+test('the session model catalog composes with the per-session projection', async (t) => {
+  const translate = await loadTranslateApi()
+  const catalog = {
+    default: { provider: 'p', model: 'default' },
+    routableProviders: ['p'],
+    groups: [{ id: 'p', name: 'P', models: [{ id: 'default', name: 'Default' }] }],
+    failures: [],
+  }
+  assert.deepEqual(
+    translate.remapModelCatalog(catalog, { next: { provider: 'p', model: 'picked' }, lastUsed: null }),
+    {
+      current: { provider: 'p', model: 'picked' },
+      routable: true,
+      groups: catalog.groups,
+      failures: [],
+    },
+  )
+  assert.deepEqual(
+    translate.remapModelCatalog(catalog, undefined).current,
+    { provider: 'p', model: 'default' },
+  )
+  assert.equal(translate.remapModelCatalog(undefined, undefined), undefined)
 })
 
 test('Android Remote keeps its build, security boundary, protocol, and locales in sync', async () => {
